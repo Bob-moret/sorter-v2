@@ -195,7 +195,27 @@ class Positioning(BaseState):
                     f"Positioning: piece {piece.uuid} ({piece.part_id}) not in active "
                     f"inventory — routing within not-in-inventory bins as {category_id}"
                 )
-            if getattr(self.shared, "bucket_passthrough_hold", False):
+            bucket_hold = getattr(self.shared, "bucket_passthrough_hold", False)
+            if bucket_hold and piece.part_id is not None:
+                notePieceProblem(
+                    piece,
+                    "bucket_hold",
+                    "Went to misc instead of its bin: a double-feed piece the camera lost was "
+                    "still loose on the channel, so it went where misc goes until that piece "
+                    "had had a couple of turns to fall.",
+                )
+            if bucket_hold and self._miscBinAddress() is not None:
+                # Same hold, but misc has a bin of its own (MISC_BIN): aim the
+                # chute there, so the loose piece and this one land in it. Open
+                # doors would not help on a machine whose doors cannot open —
+                # both would drop into whatever bin the chute last pointed at.
+                self.logger.warning(
+                    f"Positioning: unrouted piece loose on the classification channel — "
+                    f"piece {piece.uuid} goes to the MISC_BIN bin instead of claiming a bin"
+                )
+                category_id = MISC_CATEGORY
+                route_not_in_inventory = False
+            elif bucket_hold:
                 # The classification channel lost an unrouted multi-drop piece
                 # and it may still be riding the platter, about to fall the next
                 # time the channel turns. Closing a layer door now would catch
@@ -205,14 +225,6 @@ class Positioning(BaseState):
                     f"Positioning: unrouted piece loose on the classification channel — "
                     f"piece {piece.uuid} passes through to the bucket instead of claiming a bin"
                 )
-                if piece.part_id is not None:
-                    notePieceProblem(
-                        piece,
-                        "bucket_hold",
-                        "Went to misc instead of its bin: a double-feed piece the camera lost was "
-                        "still loose on the channel, so every door stayed open until it had had "
-                        "a couple of turns to fall.",
-                    )
                 self._openAllDoorsForPassthrough()
                 piece.stage = PieceStage.distributing
                 piece.distributing_at = time.time()

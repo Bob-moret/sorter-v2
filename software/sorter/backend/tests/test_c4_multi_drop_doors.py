@@ -40,6 +40,7 @@ from subsystems.distribution.chute import BinAddress
 from subsystems.distribution.positioning import Positioning
 from subsystems.distribution.states import DistributionState
 from subsystems.shared_variables import SharedVariables
+from sorting_profile import MISC_CATEGORY
 
 _LOGGER = logging.getLogger("test_c4_multi_drop_doors")
 _PRECISE_ZONE = 3
@@ -420,6 +421,31 @@ def test_positioning_sends_everything_to_the_bucket_while_a_piece_is_loose() -> 
     assert [servo.close_calls for servo in servos] == [0, 0, 0]
     assert [servo.open_calls for servo in servos] == [1, 1, 1]
     assert "chute_move" not in log
+
+
+def test_with_a_misc_bin_a_loose_piece_sends_everything_there_instead() -> None:
+    # MISC_BIN set: doors may not open on this machine, so the hold aims the
+    # chute at the misc bin and both the loose piece and this one land there.
+    shared = _mkShared()
+    shared.bucket_passthrough_hold = True
+    log: list[str] = []
+    servos = [_Servo(log, i) for i in range(3)]
+    piece = _mkClassifiedPiece(shared)
+    positioning = _mkPositioning(shared, servos, log)
+    misc_bin = BinAddress(0, 5, 2)
+    asked: list[str] = []
+    positioning._miscBinAddress = lambda: misc_bin
+    positioning._findOrAssignBinForCategory = lambda category_id, not_in_inventory=False: (
+        asked.append(category_id) or (misc_bin if category_id == MISC_CATEGORY else BinAddress(1, 0, 0)),
+        False,
+    )
+
+    assert positioning.step() is None  # waiting for the chute
+    assert asked == [MISC_CATEGORY]
+    assert piece.category_id == MISC_CATEGORY
+    assert piece.destination_bin == (0, 5, 2)
+    assert "chute_move" in log
+    assert servos[0].close_calls == 1  # the misc bin's layer catches it
 
 
 def test_passthrough_reopens_a_door_the_shadow_state_calls_open() -> None:
