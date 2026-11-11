@@ -239,6 +239,16 @@ class _Phase(Enum):
     STAGING = "staging"
 
 
+def _fmtDeg(value: Optional[float]) -> str:
+    """DEBUG(#1235): a gap for the relink-debug log lines."""
+    return "None" if value is None else f"{float(value):.1f}"
+
+
+def _fmtAgo(now: float, at: float) -> str:
+    """DEBUG(#1235): how long ago ``at`` was, for the relink-debug log lines."""
+    return "never" if not at else f"{now - at:.2f}s"
+
+
 def _logC4Piece(track_id: int, piece_uuid: str, took_over: Optional[int] = None) -> None:
     """Tie a C4 track to its piece in the control-data log, which names C4
     pieces only by track id, so the piece's earlier tracks on C2 and C3 can be
@@ -680,6 +690,13 @@ class TwoPieceClassificationChannel(Rev01BaseState):
                     self.noteProgress()
 
         for tp in created:
+            # DEBUG(#1235): where each new id first shows up, to tell a re-id of
+            # a known piece from a piece that never landed in the drop zone.
+            self.logger.info(
+                f"{LOG_TAG} [relink-debug] track appeared track={tp.track_id} "
+                f"zone={tp.zone} gap={_fmtDeg(tp.gap_to_exit)} phase={self._phase.value} "
+                f"turned_ago={_fmtAgo(now, self._turned_at)} lost={[lost.track_id for lost, _at in self._lost]}"
+            )
             self._adoptLost(tp, now)
         self._retireGonePieces(now)
         self._expireLost(now)
@@ -723,10 +740,17 @@ class TwoPieceClassificationChannel(Rev01BaseState):
             tp = self._pieces.pop(tid)
             keeps_going = tp.known_object is not None and not tp.ejected and tp is not self._eject_target
             if keeps_going:
-                successor = self._successorFor(tp, now)
+                why: list = []
+                successor = self._successorFor(tp, now, why)
                 if successor is not None:
                     self._handOver(tp, successor)
                     continue
+                self.logger.info(
+                    f"{LOG_TAG} [relink-debug] lost track={tid} zone={tp.zone} "
+                    f"gap={_fmtDeg(tp.gap_to_exit)} placed={tp.placed} phase={self._phase.value} "
+                    f"turned_ago={_fmtAgo(now, self._turned_at)} unseen_for={now - tp.last_seen:.2f}s; "
+                    f"no successor: {why or ['no other ids on the channel']}"
+                )
             # A piece already handed to distribution has a terminal status, so
             # abandonInFlightObject is a no-op for it. Only an in-flight piece
             # (photographed but never classified/distributed) is dropped from the
@@ -771,32 +795,60 @@ class TwoPieceClassificationChannel(Rev01BaseState):
         if obj is not None and obj.stage == PieceStage.distributing:
             obj.stage = PieceStage.created
 
-    def _successorFor(self, lost: _TrackedPiece, now: float) -> Optional[_TrackedPiece]:
+    def _successorFor(
+        self, lost: _TrackedPiece, now: float, why: Optional[list] = None
+    ) -> Optional[_TrackedPiece]:
         """The id now standing where ``lost`` was: an id no one photographed,
         either seen on top of it while both existed (a tracker double), or new
-        since and no further along than the channel can have carried it."""
+        since and no further along than the channel can have carried it.
+
+        DEBUG(#1235): ``why`` collects, per rejected candidate, which check
+        turned it down. It never changes the result."""
         if lost.gap_to_exit is None:
+            if why is not None:
+                why.append("lost piece has no gap")
             return None
         lost_gap = float(lost.gap_to_exit)
         turned = self._turned_at >= lost.last_seen
         best: Optional[_TrackedPiece] = None
         best_d = 0.0
         for cand in self._pieces.values():
-            if cand is lost or cand.known_object is not None or cand.double_feed:
+            if cand is lost:
+                continue
+            if cand.known_object is not None or cand.double_feed:
+                if why is not None:
+                    why.append(
+                        f"t{cand.track_id}: "
+                        + ("double feed" if cand.double_feed else "has its own record")
+                    )
                 continue
             if cand.gap_to_exit is None or now - cand.last_seen > 0.3:
+                if why is not None:
+                    why.append(f"t{cand.track_id}: not seen now")
                 continue
             then = cand.gapAt(lost.last_seen)
             if then is not None:
                 d = abs(then - lost_gap)
                 if d > _SAME_PIECE_DEG:
+                    if why is not None:
+                        why.append(
+                            f"t{cand.track_id}: double check, {d:.1f} deg apart then "
+                            f"(max {_SAME_PIECE_DEG:.0f})"
+                        )
                     continue  # it was somewhere else: another piece
             else:
                 if cand.zone == _ZONE_DROP and lost.zone != _ZONE_DROP:
+                    if why is not None:
+                        why.append(f"t{cand.track_id}: in drop zone, lost piece was not")
                     continue  # pieces never go back into the drop zone
                 moved = lost_gap - float(cand.gap_to_exit)
                 reach = _RELINK_TURNED_DEG if turned else _RELINK_STILL_DEG
                 if moved < -_RELINK_STILL_DEG or moved > reach:
+                    if why is not None:
+                        why.append(
+                            f"t{cand.track_id}: moved {moved:.1f} deg "
+                            f"(allowed {-_RELINK_STILL_DEG:.0f}..{reach:.0f}, turned={turned})"
+                        )
                     continue
                 d = abs(moved)
             if best is None or d < best_d:
@@ -829,10 +881,17 @@ class TwoPieceClassificationChannel(Rev01BaseState):
     def _adoptLost(self, tp: _TrackedPiece, now: float) -> None:
         """A new id may be a lost piece seen again (see _RELINK_WINDOW_S)."""
         for i, (lost, _at) in enumerate(self._lost):
-            if self._successorFor(lost, now) is tp:
+            why: list = []
+            successor = self._successorFor(lost, now, why)
+            if successor is tp:
                 del self._lost[i]
                 self._handOver(lost, tp)
                 return
+            self.logger.info(
+                f"{LOG_TAG} [relink-debug] new track={tp.track_id} not adopted for lost "
+                f"track={lost.track_id} (lost gap={_fmtDeg(lost.gap_to_exit)} zone={lost.zone}, "
+                f"best={None if successor is None else successor.track_id}): {why}"
+            )
 
     def _expireLost(self, now: float) -> None:
         keep: list[tuple[_TrackedPiece, float]] = []
@@ -840,6 +899,10 @@ class TwoPieceClassificationChannel(Rev01BaseState):
             if now - at <= _RELINK_WINDOW_S:
                 keep.append((lost, at))
                 continue
+            self.logger.info(
+                f"{LOG_TAG} [relink-debug] gave up on lost track={lost.track_id} after "
+                f"{_RELINK_WINDOW_S:.0f} s (gap={_fmtDeg(lost.gap_to_exit)} zone={lost.zone})"
+            )
             obj = lost.known_object
             notePieceProblem(
                 obj,
