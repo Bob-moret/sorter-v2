@@ -37,6 +37,26 @@ def _incidentHandlingOff(kind: str) -> bool:
         return False
 
 
+def _miscBinSetting() -> Optional[tuple[int, int]]:
+    """MISC_BIN=<layer>,<bin>: the bin misc pieces go to instead of passing
+    through the open doors to the bucket, counted from 1 like the Bins page
+    (``1,18`` is layer 1, bin 18). For a machine whose doors cannot open yet:
+    without working servos a passthrough lands in whatever bin the chute last
+    pointed at. Unset or unreadable, misc passes through as usual."""
+    import os
+
+    raw = os.getenv("MISC_BIN", "").strip()
+    if not raw:
+        return None
+    try:
+        layer, number = (int(part) for part in raw.split(","))
+    except ValueError:
+        return None
+    if layer < 1 or number < 1:
+        return None
+    return layer - 1, number - 1
+
+
 def _allowMultiCategoryBins() -> bool:
     try:
         from toml_config import getBinAssignmentConfig
@@ -814,6 +834,37 @@ class Positioning(BaseState):
             return None
         return address
 
+    def _miscBinAddress(self) -> Optional[BinAddress]:
+        """The bin MISC_BIN names (see _miscBinSetting), when this layout can
+        use it; otherwise None, said once per setting."""
+        setting = _miscBinSetting()
+        if setting is None:
+            return None
+        layer_idx, number = setting
+        address: Optional[BinAddress] = None
+        if layer_idx < len(self.layout.layers):
+            layer = self.layout.layers[layer_idx]
+            seen = 0
+            for section_idx, section in enumerate(layer.sections):
+                if number < seen + len(section.bins):
+                    candidate = BinAddress(layer_idx, section_idx, number - seen)
+                    if (
+                        getattr(layer, "enabled", True)
+                        and getattr(section, "enabled", True)
+                        and self._isLayerUsable(layer_idx)
+                        and self.chute.isBinReachable(candidate)
+                    ):
+                        address = candidate
+                    break
+                seen += len(section.bins)
+        if address is None and getattr(self, "_misc_bin_warned", None) != setting:
+            self._misc_bin_warned = setting
+            self.logger.warning(
+                f"Positioning: MISC_BIN layer {layer_idx + 1}, bin {number + 1} cannot be used "
+                f"here — misc passes through to the bucket"
+            )
+        return address
+
     def _findOrAssignBinForCategory(
         self, category_id: str, not_in_inventory: bool = False
     ) -> tuple[Optional[BinAddress], bool]:
@@ -823,6 +874,12 @@ class Positioning(BaseState):
         # mix. Within the not-in-inventory pool, overlap (multi-category) is
         # always allowed as the last resort ("if we run out, overlap them").
         from bin_contents import get_current_bin_piece_counts
+
+        # A bin set aside for misc (MISC_BIN) takes every misc piece, and no
+        # other category may claim or share it.
+        misc_bin = self._miscBinAddress()
+        if category_id == MISC_CATEGORY and misc_bin is not None:
+            return misc_bin, False
 
         piece_counts = get_current_bin_piece_counts()
         # A category may be assigned to more than one bin (the same category_id
@@ -867,6 +924,9 @@ class Positioning(BaseState):
                     if bool(b.not_in_inventory) != not_in_inventory:
                         continue
                     address = BinAddress(layer_idx, section_idx, bin_idx)
+                    if address == misc_bin:
+                        skipped.append(f"layer{layer_idx}.section{section_idx}.bin{bin_idx}=misc")
+                        continue
                     if not self.chute.isBinReachable(address):
                         unreachable_bins += 1
                         continue
